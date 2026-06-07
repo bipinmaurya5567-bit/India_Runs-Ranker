@@ -1,10 +1,16 @@
 """
-fusion.py — Step 6
-Reciprocal Rank Fusion (RRF) to combine semantic + behavioral rankings.
-RRF formula: score_i = Σ 1/(k + rank_i) across all score lists.
-k=60 is the standard constant from the original RRF paper.
+fusion.py — Stage 4 (upgraded: 3-way weighted RRF)
+Combines cross-encoder, behavioral, and bi-encoder semantic rankings.
+
+Formula (per candidate i):
+  score_i = 0.6 × 1/(60 + cross_rank_i)
+           + 0.3 × 1/(60 + behavioral_rank_i)
+           + 0.1 × 1/(60 + semantic_rank_i)
+
+Weights reflect: cross-encoder quality ≫ behavioral ≫ semantic (tiebreaker).
+k=60 is the standard constant from the original RRF paper (Cormack et al. 2009).
 """
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import numpy as np
 
@@ -23,28 +29,57 @@ def _ranks_from_scores(scores: np.ndarray) -> np.ndarray:
     return ranks
 
 
+def weighted_reciprocal_rank_fusion(
+    cross_encoder_scores: np.ndarray,
+    behavioral_scores: np.ndarray,
+    semantic_scores: np.ndarray,
+    k: int = RRF_K,
+    w_cross: float = 0.6,
+    w_behavioral: float = 0.3,
+    w_semantic: float = 0.1,
+) -> np.ndarray:
+    """
+    3-way weighted Reciprocal Rank Fusion.
+
+    Args:
+        cross_encoder_scores : Raw logits from cross-encoder (Stage 2.5), shape (N,).
+        behavioral_scores    : Behavioral signal scores (Stage 3), shape (N,).
+        semantic_scores      : Bi-encoder cosine similarities (Stage 2), shape (N,).
+        k                    : RRF smoothing constant (default 60).
+        w_cross              : Weight for cross-encoder rank  (default 0.6).
+        w_behavioral         : Weight for behavioral rank      (default 0.3).
+        w_semantic           : Weight for semantic rank        (default 0.1).
+
+    Returns:
+        rrf_scores : np.ndarray of shape (N,); higher = better fused rank.
+    """
+    cross_ranks    = _ranks_from_scores(cross_encoder_scores)
+    behav_ranks    = _ranks_from_scores(behavioral_scores)
+    semantic_ranks = _ranks_from_scores(semantic_scores)
+
+    rrf = (
+        w_cross      * (1.0 / (k + cross_ranks))    +
+        w_behavioral * (1.0 / (k + behav_ranks))     +
+        w_semantic   * (1.0 / (k + semantic_ranks))
+    )
+    return rrf
+
+
+# Keep the old name as an alias for backwards compatibility with any
+# scripts that still call reciprocal_rank_fusion directly.
 def reciprocal_rank_fusion(
     scores_list: List[np.ndarray],
     k: int = RRF_K,
 ) -> np.ndarray:
     """
-    Combine multiple ranked lists via Reciprocal Rank Fusion.
-
-    Args:
-        scores_list: List of score arrays, each of length N.
-                     Higher score = better candidate in each list.
-        k:           RRF constant (default 60)
-
-    Returns:
-        rrf_scores: np.ndarray of shape (N,); higher = better fused rank.
+    Legacy equal-weight RRF (kept for compatibility).
+    Prefer weighted_reciprocal_rank_fusion for new code.
     """
     n = len(scores_list[0])
     rrf = np.zeros(n, dtype=np.float64)
-
     for scores in scores_list:
         ranks = _ranks_from_scores(scores)
         rrf += 1.0 / (k + ranks)
-
     return rrf
 
 
@@ -53,11 +88,12 @@ def get_top_k_candidates(
     rrf_scores: np.ndarray,
     semantic_scores: np.ndarray,
     behavioral_scores: np.ndarray,
+    cross_encoder_scores: np.ndarray,
     penalties: List[List[str]],
     k: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    Sort candidates by RRF score (desc) and return the top-k with metadata.
+    Sort candidates by weighted RRF score (desc) and return the top-k with metadata.
 
     Tie-breaking: equal RRF scores → sort by candidate_id ascending
     (required by validate_submission.py).
@@ -65,23 +101,24 @@ def get_top_k_candidates(
     Returns:
         List of dicts, each containing:
           candidate, rrf_score, semantic_score, behavioral_score,
-          local_idx, penalties
+          cross_encoder_score, local_idx, penalties
     """
     n = len(rrf_scores)
     entries = []
     for i in range(n):
         cid = candidates[i].get("candidate_id", f"UNKNOWN_{i}")
         entries.append({
-            "candidate":        candidates[i],
-            "rrf_score":        float(rrf_scores[i]),
-            "semantic_score":   float(semantic_scores[i]),
-            "behavioral_score": float(behavioral_scores[i]),
-            "local_idx":        i,
-            "penalties":        penalties[i],
-            "candidate_id":     cid,
+            "candidate":           candidates[i],
+            "rrf_score":           float(rrf_scores[i]),
+            "semantic_score":      float(semantic_scores[i]),
+            "behavioral_score":    float(behavioral_scores[i]),
+            "cross_encoder_score": float(cross_encoder_scores[i]),
+            "local_idx":           i,
+            "penalties":           penalties[i],
+            "candidate_id":        cid,
         })
 
-    # Primary sort: RRF descending (formatted to 6 decimals to match CSV output); tie-break: candidate_id ascending
+    # Primary sort: RRF descending; tie-break: candidate_id ascending
     entries.sort(key=lambda e: (-float(f"{e['rrf_score']:.6f}"), e["candidate_id"]))
 
     return entries[:k]

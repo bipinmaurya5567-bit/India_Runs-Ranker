@@ -1,13 +1,23 @@
 """
-main.py — Step 8
-Orchestrates the 3-stage ranking pipeline:
+main.py — Upgraded 5-stage ranking pipeline
+
 1. Load candidates.jsonl and build text representations.
-2. Build BM25 index and retrieve top 2000 candidates using job description query.
-3. Rerank top 2000 candidates using sentence-transformers (all-MiniLM-L6-v2) semantic embedding.
-4. Score top 2000 candidates on behavioral signals from redrob_signals, applying penalties.
-5. Fuse rankings using Reciprocal Rank Fusion (RRF) and perform tie-breaking.
-6. Generate non-templated reasoning for the top 100 candidates.
-7. Save output to submission.csv and run the validator.
+2. BM25: build index, retrieve top-2000.
+3. Bi-encoder (all-MiniLM-L6-v2): filter top-2000 → top-500 by cosine sim.
+4. Cross-encoder (ms-marco-MiniLM-L-6-v2): rerank top-500 → relevance scores.  [NEW]
+5. Behavioral signals (JD-tuned): score top-500, apply honeypot penalties.
+6. 3-way weighted RRF: fuse cross-encoder (0.6), behavioral (0.3), semantic (0.1).
+7. Generate improved reasoning for top-100 (varied structure, cross-encoder confidence).
+8. Save output to submission.csv and run the validator.
+
+Timing budget (CPU, no GPU):
+  Stage 1 BM25        : ~60 s
+  Stage 2 Bi-encoder  : ~15 s   (2000 → 500)
+  Stage 2.5 Cross-enc : ~120 s  (500, batch=32)  ← biggest quality gain
+  Stage 3 Signals     : ~10 s
+  Stage 4 RRF         : ~5 s
+  Stage 5 Reasoning   : ~30 s
+  TOTAL               : ~240 s = 4 min  (within 5-min limit)
 """
 
 import csv
@@ -21,9 +31,12 @@ import numpy as np
 # Import our package modules
 from ranker.loader import load_candidates, build_candidate_text
 from ranker.bm25_stage import build_bm25_index, retrieve_top_k
-from ranker.embed_stage import load_model, encode_texts, compute_cosine_similarities
+from ranker.embed_stage import (
+    load_model, encode_texts, compute_cosine_similarities,
+    CrossEncoderStage,
+)
 from ranker.signals import compute_all_behavioral_scores
-from ranker.fusion import reciprocal_rank_fusion, get_top_k_candidates
+from ranker.fusion import weighted_reciprocal_rank_fusion, get_top_k_candidates
 from ranker.reasoning import generate_reasoning
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -129,52 +142,75 @@ def main():
     sub_candidates = [candidates[idx] for idx in top_indices]
     sub_texts = [candidate_texts[idx] for idx in top_indices]
     
-    # ── 5. STAGE 2: Dense Semantic Embedding Reranking ────────────────────────
+    # ── 5. STAGE 2: Bi-encoder filter 2000 → 500 ──────────────────────────────
     t_embed = time.time()
-    print("STAGE 2: Encoding JD and top-2000 candidates with all-MiniLM-L6-v2...")
-    model = load_model()
-    
+    print("STAGE 2: Encoding JD + top-2000 with all-MiniLM-L6-v2 (filter to top-500)...")
+    bi_model = load_model()
+
     print("    Encoding job description query...")
-    jd_embedding = encode_texts(model, [jd_query], desc="Query")[0]
-    
+    jd_embedding = encode_texts(bi_model, [jd_query], desc="Query")[0]
+
     print("    Encoding top-2000 candidates...")
-    candidate_embeddings = encode_texts(model, sub_texts, desc="Candidates")
-    
+    candidate_embeddings = encode_texts(bi_model, sub_texts, desc="Candidates")
+
     print("    Computing cosine similarities...")
-    semantic_scores = compute_cosine_similarities(jd_embedding, candidate_embeddings)
+    all_semantic_scores = compute_cosine_similarities(jd_embedding, candidate_embeddings)
+
+    # Keep top-500 by cosine similarity for cross-encoder
+    top500_local = np.argsort(all_semantic_scores)[::-1][:500]
+    sub500_candidates = [sub_candidates[i] for i in top500_local]
+    sub500_texts      = [sub_texts[i]      for i in top500_local]
+    semantic_scores   = all_semantic_scores[top500_local]   # shape (500,)
+    print(f"  Filtered to top-500 candidates.")
     print(f"  Stage 2 completed in {time.time() - t_embed:.2f}s\n")
-    
-    # ── 6. STAGE 3: Behavioral Signal Scoring ─────────────────────────────────
+
+    # ── 6. STAGE 2.5: Cross-encoder reranking 500 candidates ─────────────────
+    t_cross = time.time()
+    print("STAGE 2.5: Cross-encoder reranking top-500 (batch_size=32)...")
+    cross_stage = CrossEncoderStage()   # loads ~90 MB model, runs warm-up
+    cross_encoder_scores = cross_stage.rerank(
+        jd_text=jd_query,
+        candidate_texts=sub500_texts,
+        batch_size=32,
+    )
+    print(f"  Stage 2.5 completed in {time.time() - t_cross:.2f}s\n")
+
+    # ── 7. STAGE 3: Behavioral Signal Scoring ─────────────────────────────────
     t_signals = time.time()
-    print("STAGE 3: Scoring behavioral signals & applying honeypot checks...")
-    behavioral_scores, penalties_list = compute_all_behavioral_scores(sub_candidates)
+    print("STAGE 3: Scoring behavioral signals & applying honeypot checks (top-500)...")
+    behavioral_scores, penalties_list = compute_all_behavioral_scores(sub500_candidates)
     print(f"  Stage 3 completed in {time.time() - t_signals:.2f}s\n")
     
-    # ── 7. RRF Fusion & Tie Breaking ──────────────────────────────────────────
+    # ── 8. STAGE 4: 3-way Weighted RRF Fusion ─────────────────────────────────
     t_fusion = time.time()
-    print("Fusing ranks via Reciprocal Rank Fusion (RRF)...")
-    rrf_scores = reciprocal_rank_fusion([semantic_scores, behavioral_scores])
-    
+    print("STAGE 4: 3-way weighted RRF (cross=0.6, behavioral=0.3, semantic=0.1)...")
+    rrf_scores = weighted_reciprocal_rank_fusion(
+        cross_encoder_scores=cross_encoder_scores,
+        behavioral_scores=behavioral_scores,
+        semantic_scores=semantic_scores,
+    )
+
     top_100_entries = get_top_k_candidates(
-        candidates=sub_candidates,
+        candidates=sub500_candidates,
         rrf_scores=rrf_scores,
         semantic_scores=semantic_scores,
         behavioral_scores=behavioral_scores,
+        cross_encoder_scores=cross_encoder_scores,
         penalties=penalties_list,
         k=100
     )
     print(f"  Selected top-100 candidates with tie-breaking rules applied.")
-    print(f"  RRF Fusion completed in {time.time() - t_fusion:.2f}s\n")
+    print(f"  Stage 4 completed in {time.time() - t_fusion:.2f}s\n")
     
-    # ── 8. Generate Reasoning and Write Output ───────────────────────────────
+    # ── 9. STAGE 5: Generate Reasoning and Write Output ──────────────────────
     t_write = time.time()
-    print("Generating personalized reasoning and writing to CSV...")
-    
+    print("STAGE 5: Generating personalized reasoning and writing to CSV...")
+
     with open(OUTPUT_CSV, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         # Header
         writer.writerow(["candidate_id", "rank", "score", "reasoning"])
-        
+
         for i, entry in enumerate(top_100_entries):
             rank = i + 1
             reasoning = generate_reasoning(
@@ -183,6 +219,7 @@ def main():
                 semantic_score=entry["semantic_score"],
                 behavioral_score=entry["behavioral_score"],
                 rrf_score=entry["rrf_score"],
+                cross_encoder_score=entry["cross_encoder_score"],
                 penalties=entry["penalties"]
             )
             
@@ -197,12 +234,13 @@ def main():
             ])
             
     print(f"  Output saved successfully to: {OUTPUT_CSV.absolute()}")
-    print(f"  Reasoning generation and output completed in {time.time() - t_write:.2f}s\n")
-    
-    # ── 9. Final Stats ────────────────────────────────────────────────────────
+    print(f"  Stage 5 completed in {time.time() - t_write:.2f}s\n")
+
+    # ── 10. Final Stats ───────────────────────────────────────────────────────
     total_time = time.time() - start_time
     print("======================================================================")
-    print(f"Ranking Pipeline Finished in: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+    print(f"Upgraded Pipeline Finished in: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+    print(f"Stages: BM25 → Bi-encoder(2000→500) → Cross-encoder(500) → Signals → 3-way RRF")
     print(f"Peak RAM expected to be well below 16 GB.")
     print("======================================================================")
 
